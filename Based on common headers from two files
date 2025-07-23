@@ -1,0 +1,46 @@
+import pandas as pd
+import os
+
+# Set the working directory path
+path = r"D:\Vineetha\Nipah\Prediction_08072025\Prediction_3_tools_knepper"
+
+# Load the Excel files
+gasphos_file = os.path.join(path, "Knepper_Gasphos.xlsx")
+netphos_file = os.path.join(path, "Knepper_NetPhos.xlsx")
+
+df_gas = pd.read_excel(gasphos_file, sheet_name='Sheet1')
+df_net = pd.read_excel(netphos_file, sheet_name='Sheet1')
+
+# Function to explode comma-separated columns
+def clean_explode(df, cols):
+    for col in cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.split(',').apply(lambda x: [i.strip() for i in x if i.strip()])
+    return df.explode(cols)
+
+# Rename columns to avoid clash during merge
+df_gas = df_gas.rename(columns={
+    'Kinase': 'Kinase_gasphos',
+    'Gene_symbol_Knepper': 'Gene_symbol_Knepper_gasphos'
+})
+
+df_net = df_net.rename(columns={
+    'Kinase': 'Kinase_netphos',
+    'Gene_symbol_Knepper': 'Gene_symbol_Knepper_netphos'
+})
+
+# Explode relevant columns
+df_gas_exp = clean_explode(df_gas.copy(), ['Kinase_gasphos', 'Gene_symbol_Knepper_gasphos'])
+df_net_exp = clean_explode(df_net.copy(), ['Kinase_netphos', 'Gene_symbol_Knepper_netphos'])
+
+# Merge on 'Uniprot_Header' and 'Site'
+merged_df = pd.merge(
+    df_gas_exp,
+    df_net_exp,
+    on=['Uniprot_Header', 'Site'],
+    how='outer'
+)
+
+# Output file
+output_file = os.path.join(path, "Merged_Gasphos_Netphos_Exploded.xlsx")
+merged_df.to_excel(output_file, index=False)
