@@ -1,0 +1,42 @@
+import pandas as pd
+
+# Load Excel file
+file_path = r"D:\Vineetha\Nipah\Prediction_08072025\Prediction_3_tools_knepper\Merged_Gasphos_Netphos.xlsx"
+df = pd.read_excel(file_path, sheet_name="Sheet1")
+
+# Group by Site and Uniprot_Header, collect lists
+grouped = df.groupby(["Site", "Uniprot_Header"]).agg({
+    "Gene_symbol_gasphos": list,
+    "Gene_symbol_netphos": list,
+    "Kinase_netphos": list,
+    "kinase_gasphos": list
+}).reset_index()
+
+# Safe function to clean and combine
+def combine_symbols(row):
+    combined = row["Gene_symbol_gasphos"] + row["Gene_symbol_netphos"]
+    clean = [str(g).strip() for g in combined if pd.notna(g)]
+    return ",".join(sorted(set(clean)))
+
+def combine_kinases(values):
+    clean = [str(k).strip() for k in values if pd.notna(k)]
+    return ",".join(sorted(set(clean)))
+
+# Apply functions
+grouped["Gene_symbol_club"] = grouped.apply(combine_symbols, axis=1)
+grouped["Kinase_netphos_club"] = grouped["Kinase_netphos"].apply(combine_kinases)
+grouped["Kinase_gasphos_club"] = grouped["kinase_gasphos"].apply(combine_kinases)
+
+# Final dataframe
+final_df = grouped[[
+    "Uniprot_Header", "Site", 
+    "Gene_symbol_club", 
+    "Kinase_netphos_club", 
+    "Kinase_gasphos_club"
+]]
+
+# Save to Excel
+output_path = r"D:\Vineetha\Nipah\Prediction_08072025\Prediction_3_tools_knepper\Gene_Kinase_Clubbed_Output.xlsx"
+final_df.to_excel(output_path, index=False)
+
+print("✅ Final file with gene and kinase clubs saved to:", output_path)
