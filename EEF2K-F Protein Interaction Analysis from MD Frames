@@ -1,0 +1,76 @@
+import pandas as pd
+from pathlib import Path
+import re
+
+# -------- Paths --------
+folder = Path(r"D:\Vineetha\Vineetha\VINEETHA_PHD\NIPAH\To submit\Revision\Prepare\MD\REVISION\REPLICATE1")
+output_file = folder / "EEF2K_F_protein_ALL_FRAMES.xlsx"
+
+# -------- Columns to Keep (normalized names) --------
+columns_to_keep = [
+    "Set1 Residues", "Set2 Residues", "Distance(A)", "Specific Interactions",
+    "# H-Bond", "H-Bond % Poses",
+    "# Salt Bridges", "Salt Bridges % Poses",
+    "# Pi Stacking", "Pi Stacking % Poses",
+    "# Disulfides", "Disulfides % Poses",
+    "# vdW Clash", "vdW Clash % Poses"
+]
+
+# Regex to extract frame number
+frame_pattern = re.compile(r".*Frame[_ ]?(\d+)", re.IGNORECASE)
+
+# -------- Step 1: Load all CSV frames --------
+frame_data = []
+
+for csv_file in sorted(folder.glob("EEF2K_F-protein_Frame_*.csv")):
+    match = frame_pattern.match(csv_file.stem)
+    if not match:
+        print(f"⚠️ Skipping file (frame number not found): {csv_file}")
+        continue
+
+    frame_num = int(match.group(1))
+
+    try:
+        df = pd.read_csv(csv_file)
+    except Exception as e:
+        print(f"⚠️ Could not read {csv_file}: {e}")
+        continue
+
+    # --- Normalize column names ---
+    df.columns = df.columns.str.replace("\n", " ", regex=False).str.strip()
+
+    # Keep only required cols
+    df = df.loc[:, df.columns.intersection(columns_to_keep)]
+    if df.empty:
+        continue
+
+    # Create ResiduePair + Frame
+    df["ResiduePair"] = df["Set1 Residues"].astype(str) + "-" + df["Set2 Residues"].astype(str)
+    df["Frame"] = frame_num
+
+    frame_data.append(df)
+
+# -------- Step 2: Merge all frames into one big DataFrame --------
+if frame_data:
+    final_df = pd.concat(frame_data, ignore_index=True)
+    final_df = final_df[columns_to_keep + ["Frame", "ResiduePair"]]
+
+    # Sort nicely by ResiduePair then Frame
+    final_df.sort_values(by=["ResiduePair", "Frame"], inplace=True)
+
+    # -------- Step 3: Save to Excel --------
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        final_df.to_excel(writer, sheet_name="ResidueInteractions", index=False)
+
+        # Summary sheet
+        summary = (
+            final_df.groupby("Frame")["ResiduePair"]
+            .nunique()
+            .reset_index()
+            .rename(columns={"ResiduePair": "ResiduePairs_Count"})
+        )
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+
+    print(f"✅ Final table saved at:\n   {output_file}")
+else:
+    print("⚠️ No valid CSV data found in the folder.")
