@@ -1,0 +1,79 @@
+from pathlib import Path
+
+# Input PDB
+infile = Path(r"D:\Vineetha\Vineetha\VINEETHA_PHD\NIPAH\To submit\Revision\MD_Results_Bindingaffinity\Replicate2\replicate2_eef2k.pdb")
+outfile = infile.with_name("replicate2_eef2k_standard_formatted.pdb")
+
+# Map non-standard residues to standard residues
+residue_map = {
+    "HIE": "HIS",
+    "HID": "HIS",
+    "HIP": "HIS",
+    "ASH": "ASP",
+    "GLH": "GLU",
+    "LYN": "LYS",
+    "CYX": "CYS",  # oxidized cysteine
+    # Add more mappings if needed
+}
+
+# Standard residues
+standard_residues = [
+    "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY",
+    "HIS","ILE","LEU","LYS","MET","PHE","PRO","SER",
+    "THR","TRP","TYR","VAL"
+]
+
+def safe_float(s, default=0.0):
+    try:
+        return float(s)
+    except:
+        return default
+
+def safe_int(s, default=0):
+    try:
+        return int(s)
+    except:
+        return default
+
+def format_pdb_line(record, serial, name, altloc, resname, chain, resseq, icode,
+                    x, y, z, occ, temp, element, charge):
+    """
+    Return a properly formatted PDB line (80 chars fixed-width)
+    """
+    return f"{record:<6}{serial:>5} {name:<4}{altloc:1}{resname:>3} {chain:1}" \
+           f"{resseq:>4}{icode:1}   {x:>8.3f}{y:>8.3f}{z:>8.3f}" \
+           f"{occ:>6.2f}{temp:>6.2f}          {element:>2}{charge:>2}\n"
+
+with open(infile, "r") as fin, open(outfile, "w") as fout:
+    for line in fin:
+        if line.startswith(("ATOM", "HETATM")):
+            # Extract fields with safe defaults
+            record = line[0:6].strip()
+            serial = safe_int(line[6:11])
+            name = line[12:16].strip()
+            altloc = line[16:17].strip()
+            resname = line[17:20].strip()
+            chain = line[21:22].strip()
+            resseq = safe_int(line[22:26])
+            icode = line[26:27].strip()
+            x = safe_float(line[30:38])
+            y = safe_float(line[38:46])
+            z = safe_float(line[46:54])
+            occ = safe_float(line[54:60], 1.0)
+            temp = safe_float(line[60:66], 0.0)
+            element = line[76:78].strip() if len(line) >= 78 else name[0]
+            charge = line[78:80].strip() if len(line) >= 80 else ""
+
+            # Replace non-standard residues
+            if resname not in standard_residues:
+                resname = residue_map.get(resname, "ALA")  # default to ALA if unknown
+
+            # Write formatted line
+            fout.write(format_pdb_line(record, serial, name, altloc, resname,
+                                       chain, resseq, icode, x, y, z, occ,
+                                       temp, element, charge))
+        else:
+            # Keep non-ATOM/HETATM lines as-is
+            fout.write(line)
+
+print(f"Standardized and formatted PDB saved as: {outfile}")
