@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""
+virus_gene_comparison.py
+=========================
+
+Walks a folder structure organized like this:
+
+    Virus_Functional_Annotation_Serum/
+        CHIKV/
+            Upregulated/Annotated_Dataset_with_GO.csv
+            Downregulated/Annotated_Dataset_with_GO.csv
+        DENV/
+            Upregulated/Annotated_Dataset_with_GO.csv
+            Downregulated/Annotated_Dataset_with_GO.csv
+        ZIKV/
+            ...
+
+    - VIRUS name  = top-level folder name (e.g. "CHIKV")
+    - DIRECTION   = subfolder name ("Upregulated"/"Downregulated"), not a
+                    column in the file.
+
+WHY THIS VERSION COLLAPSES ROWS
+--------------------------------
+Annotated_Dataset_with_GO.csv-style files have ONE ROW PER GO-TERM, so the
+same gene is repeated many times (once per GO annotation), and GO-related
+columns (Reference_GO_REFs, GO_Evidence_Codes, etc.) are only filled on a
+subset of those repeated rows. That leaves lots of blank-looking cells
+scattered through the output even after dropping fully-empty columns.
+
+To fix that, this script first COLLAPSES all rows sharing the same
+(SYMBOL, Virus, Direction) into a single row per gene:
+    - Columns whose value is the same across all of a gene's rows keep that
+      single value (e.g. GENENAME, Fold_Change, ENTREZID).
+    - Columns that vary across a gene's GO-term rows (e.g. GO, GO_TERM,
+      ONTOLOGY, EVIDENCE) are combined into one cell as a "; "-separated
+      list of the unique values.
+    - Truly empty columns (blank for every gene) are dropped entirely.
+
+The result: one clean, fully-populated row per gene, with all of its GO
+annotations preserved (just consolidated) instead of spread across dozens
+of near-duplicate rows.
+
+Produces:
+    1. Common symbols   -> collapsed rows for SYMBOLs present in >= 2 viruses (any direction)
+    2. Unique symbols   -> collapsed rows for SYMBOLs present in exactly 1 virus (one file PER virus)
+    3. Common Up        -> collapsed rows for SYMBOLs "Up" in >= 2 viruses
+    4. Common Down      -> collapsed rows for SYMBOLs "Down" in >= 2 viruses
+    5. Unique Up        -> collapsed rows for SYMBOLs "Up" in only 1 virus (one file PER virus)
+    6. Unique Down      -> collapsed rows for SYMBOLs "Down" in only 1 virus (one file PER virus)
+
+--------------------------------------------------------------------------
+HOW TO USE
+--------------------------------------------------------------------------
+1. Set ROOT_DIR below to your top-level folder, e.g.:
+
+       ROOT_DIR = r"D:\\Ph.D\\First_Objective\\Devika_Reanalysis\\Functional_Annotation\\Virus_Functional_Annotation_Serum"
+
+2. Run:
+       python virus_gene_comparison.py
+
+If your gene symbol column isn't named "SYMBOL", edit SYMBOL_COL below.
+
+--------------------------------------------------------------------------
+OUTPUT  (written to ROOT_DIR/gene_comparison_output/)
+--------------------------------------------------------------------------
+Combined tables (one row per gene, blank columns removed):
+    - common_symbols_full.csv     collapsed rows for SYMBOLs in >= 2 viruses (any direction)
+    - common_up_full.csv          collapsed rows for SYMBOLs "Up" in >= 2 viruses
+    - common_down_full.csv        collapsed rows for SYMBOLs "Down" in >= 2 viruses
+    - unique_symbols_full.csv     collapsed rows for SYMBOLs unique to 1 virus (all viruses combined)
+    - unique_up_full.csv          collapsed rows for SYMBOLs "Up" in only 1 virus (all viruses combined)
+    - unique_down_full.csv        collapsed rows for SYMBOLs "Down" in only 1 virus (all viruses combined)
+    - summary.xlsx                 short SYMBOL-level summary sheets (counts only, for a quick look)
+
+Per-virus files (one row per gene, blank columns removed, one CSV per virus):
+    - by_virus/Unique_Symbols_<Virus>.csv
+    - by_virus/Unique_Up_<Virus>.csv
+    - by_virus/Unique_Down_<Virus>.csv
+"""
+
+import os
+import sys
+from collections import defaultdict
+
+import pandas as pd
+
+# ============================================================================
+# 1. CONFIGURATION - EDIT THIS SECTION FOR YOUR DATA
+# ============================================================================
+
+# Top-level folder that directly contains one subfolder per virus.
+ROOT_DIR = r"D:\Ph.D\First_Objective\Devika_Reanalysis\Plasma\Plasma_Diff_Virus_Details.xlsx"
+
+SYMBOL_COL = "SYMBOL"     # gene symbol column name inside each CSV/XLSX
+FILE_EXTENSIONS = (".csv", ".tsv", ".xlsx", ".xls")
+
+OUTPUT_DIR_NAME = "gene_comparison_output"   # created inside ROOT_DIR
+
+# A column is dropped from an output table if the fraction of genes in that
+# table with a blank value in it is >= this threshold.
+#   1.0  -> only drop a column if it is blank for EVERY gene (safest, keeps
+#           the most data; this was the previous default behavior)
+#   0.5  -> drop a column if HALF or more of the genes are blank in it
+#           (e.g. drops EVIDENCE_GO/Reference_GO_REFs/etc. in datasets where
+#           only some genes have a secondary curated GO reference)
+#   0.0  -> drop a column if even a single gene is blank in it (very
+#           aggressive -- will likely remove most annotation columns)
+# There is no "correct" value: a lower threshold means a cleaner-looking
+# table but real data gets discarded for the genes that DID have it.
+MAX_BLANK_FRACTION = 1.0
+
+# ============================================================================
+# 2. HELPER FUNCTIONS
+# ============================================================================
+
+def load_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        return pd.read_excel(path)
+    elif ext == ".tsv":
+        return pd.read_csv(path, sep="\t")
+    else:
+        return pd.read_csv(path)
+
+
+def classify_direction_from_foldername(name):
+    n = name.strip().lower()
+    if "up" in n:
+        return "Up"
+    if "down" in n:
+        return "Down"
+    return None
+
+
+def find_direction_folders(virus_dir):
+    result = {"Up": None, "Down": None}
+    for entry in os.scandir(virus_dir):
+        if entry.is_dir():
+            direction = classify_direction_from_foldername(entry.name)
+            if direction and result[direction] is None:
+                result[direction] = entry.path
+    return result
+
+
+def find_data_files(folder):
+    if not folder or not os.path.isdir(folder):
+        return []
+    files = []
+    for entry in os.scandir(folder):
+        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in FILE_EXTENSIONS:
+            files.append(entry.path)
+    return files
+
+
+def load_and_tag(filepaths, virus_name, direction):
+    """Load full dataframes from filepaths, keep ALL original columns, and
+    add/overwrite 'Virus' and 'Direction' columns. Returns one concatenated
+    dataframe (may be empty)."""
+    frames = []
+    for fp in filepaths:
+        try:
+            df = load_file(fp)
+        except Exception as e:
+            print(f"    [WARNING] Could not read {fp}: {e}")
+            continue
+        if SYMBOL_COL not in df.columns:
+            print(f"    [WARNING] '{SYMBOL_COL}' column not found in {fp}. "
+                  f"Available columns: {list(df.columns)}")
+            continue
+        df = df.copy()
+        df[SYMBOL_COL] = df[SYMBOL_COL].astype(str).str.strip()
+        df = df[df[SYMBOL_COL] != ""]
+        df = df[df[SYMBOL_COL].str.lower() != "nan"]
+        df["Virus"] = virus_name
+        df["Direction"] = direction
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def _combine_column(series):
+    """Collapse a column's values within one (SYMBOL, Virus, Direction) group:
+    a single repeated value stays scalar; multiple distinct values are joined
+    into one '; '-separated string; all-blank becomes NaN."""
+    vals = series.dropna()
+    vals = vals[vals.astype(str).str.strip() != ""]
+    if len(vals) == 0:
+        return pd.NA
+    uniq = pd.unique(vals.astype(str).str.strip())
+    if len(uniq) == 1:
+        return uniq[0]
+    return "; ".join(sorted(uniq))
+
+
+def collapse_to_one_row_per_gene(df, group_cols=(None, "Virus", "Direction")):
+    """Collapse GO-term-expanded duplicate rows down to one row per
+    (SYMBOL, Virus, Direction), merging varying columns into '; '-joined
+    strings. group_cols[0] is filled in with SYMBOL_COL by the caller."""
+    if df.empty:
+        return df
+    group_cols = [SYMBOL_COL if c is None else c for c in group_cols]
+    other_cols = [c for c in df.columns if c not in group_cols]
+    grouped = df.groupby(group_cols, dropna=False)[other_cols].agg(_combine_column)
+    return grouped.reset_index()
+
+
+def symbol_to_virus_set(df):
+    mapping = defaultdict(set)
+    if df.empty:
+        return mapping
+    for symbol, virus in df[[SYMBOL_COL, "Virus"]].drop_duplicates().itertuples(index=False):
+        mapping[symbol].add(virus)
+    return mapping
+
+
+def common_unique_symbol_sets(mapping):
+    common = set()
+    unique_by_virus = defaultdict(set)
+    for symbol, viruses in mapping.items():
+        if len(viruses) >= 2:
+            common.add(symbol)
+        elif len(viruses) == 1:
+            unique_by_virus[next(iter(viruses))].add(symbol)
+    return common, unique_by_virus
+
+
+def summary_counts_df(mapping):
+    rows = []
+    for symbol, viruses in mapping.items():
+        rows.append({"SYMBOL": symbol, "Viruses": ", ".join(sorted(viruses)), "Count": len(viruses)})
+    if not rows:
+        return pd.DataFrame(columns=["SYMBOL", "Viruses", "Count"])
+    return pd.DataFrame(rows).sort_values(["Count", "SYMBOL"], ascending=[False, True])
+
+
+def order_columns(df):
+    if df.empty:
+        return df
+    lead = [c for c in [SYMBOL_COL, "Virus", "Direction"] if c in df.columns]
+    rest = [c for c in df.columns if c not in lead]
+    return df[lead + rest]
+
+
+def drop_blank_columns(df, max_blank_fraction=MAX_BLANK_FRACTION):
+    """Drop columns whose fraction of blank (NaN or whitespace-only) values,
+    among the rows in this specific table, is >= max_blank_fraction."""
+    if df.empty:
+        return df
+    n = len(df)
+    keep_cols = []
+    for c in df.columns:
+        col = df[c]
+        is_blank = col.isna() | (col.astype(str).str.strip() == "")
+        blank_fraction = is_blank.sum() / n
+        if blank_fraction >= max_blank_fraction:
+            continue
+        keep_cols.append(c)
+    return df[keep_cols]
+
+
+def finalize(df, sort_cols):
+    """Order columns, drop fully-blank columns, sort, reset index."""
+    if df.empty:
+        return df
+    df = order_columns(df)
+    df = drop_blank_columns(df)
+    existing_sort_cols = [c for c in sort_cols if c in df.columns]
+    if existing_sort_cols:
+        df = df.sort_values(existing_sort_cols)
+    return df.reset_index(drop=True)
+
+
+def write_per_virus_full(df, symbol_sets_by_virus, label, out_subdir):
+    """Write one CSV per virus with collapsed rows restricted to that virus's unique symbol set."""
+    os.makedirs(out_subdir, exist_ok=True)
+    written = []
+    for virus, symbols in symbol_sets_by_virus.items():
+        if not symbols:
+            continue
+        sub = df[(df["Virus"] == virus) & (df[SYMBOL_COL].isin(symbols))]
+        sub = finalize(sub, [SYMBOL_COL])
+        safe_virus = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(virus))
+        fname = f"Unique_{label}_{safe_virus}.csv"
+        path = os.path.join(out_subdir, fname)
+        sub.to_csv(path, index=False)
+        written.append(path)
+    return written
+
+
+# ============================================================================
+# 3. MAIN
+# ============================================================================
+
+def main():
+    if not os.path.isdir(ROOT_DIR):
+        print(f"[ERROR] ROOT_DIR not found or not a directory: {ROOT_DIR}")
+        sys.exit(1)
+
+    virus_dirs = sorted(
+        entry.path for entry in os.scandir(ROOT_DIR) if entry.is_dir() and entry.name != OUTPUT_DIR_NAME
+    )
+    if not virus_dirs:
+        print(f"[ERROR] No virus subfolders found directly under: {ROOT_DIR}")
+        sys.exit(1)
+
+    print(f"Found {len(virus_dirs)} virus folder(s) under {ROOT_DIR}:")
+
+    all_frames = []  # every tagged row, all viruses, all directions, full columns
+
+    for virus_dir in virus_dirs:
+        virus_name = os.path.basename(virus_dir.rstrip("\\/"))
+        print(f"\n  Virus: {virus_name}  ({virus_dir})")
+
+        dir_folders = find_direction_folders(virus_dir)
+        up_files = find_data_files(dir_folders["Up"])
+        down_files = find_data_files(dir_folders["Down"])
+
+        if not dir_folders["Up"]:
+            print(f"    [WARNING] No 'Upregulated'-style subfolder found for {virus_name}.")
+        if not dir_folders["Down"]:
+            print(f"    [WARNING] No 'Downregulated'-style subfolder found for {virus_name}.")
+
+        up_df = load_and_tag(up_files, virus_name, "Up")
+        down_df = load_and_tag(down_files, virus_name, "Down")
+
+        print(f"    Upregulated rows read:   {len(up_df)}  ({up_df[SYMBOL_COL].nunique() if not up_df.empty else 0} unique symbols, from {len(up_files)} file(s))")
+        print(f"    Downregulated rows read: {len(down_df)}  ({down_df[SYMBOL_COL].nunique() if not down_df.empty else 0} unique symbols, from {len(down_files)} file(s))")
+
+        if not up_df.empty:
+            all_frames.append(up_df)
+        if not down_df.empty:
+            all_frames.append(down_df)
+
+    if not all_frames:
+        print("\n[ERROR] No data loaded from any virus/direction folder. Nothing to compare.")
+        sys.exit(1)
+
+    raw_df = pd.concat(all_frames, ignore_index=True, sort=False)
+
+    print("\nCollapsing repeated GO-term rows down to one row per gene ...")
+    master_df = collapse_to_one_row_per_gene(raw_df)
+    print(f"  Rows before collapsing: {len(raw_df)}  ->  after collapsing: {len(master_df)}")
+
+    n_viruses = len(virus_dirs)
+    if n_viruses < 2:
+        print("\n  [NOTE] Only 1 virus folder found -- 'common' results will be empty.")
+
+    # --- symbol -> set(viruses), any direction ---
+    any_dir_map = symbol_to_virus_set(master_df)
+    common_symbols, unique_symbols_by_virus = common_unique_symbol_sets(any_dir_map)
+
+    # --- per-direction maps ---
+    up_only_df = master_df[master_df["Direction"] == "Up"]
+    down_only_df = master_df[master_df["Direction"] == "Down"]
+    up_map = symbol_to_virus_set(up_only_df)
+    down_map = symbol_to_virus_set(down_only_df)
+    common_up, unique_up_by_virus = common_unique_symbol_sets(up_map)
+    common_down, unique_down_by_virus = common_unique_symbol_sets(down_map)
+
+    # --- Build collapsed output tables (blank columns dropped) ---
+    common_symbols_full = finalize(
+        master_df[master_df[SYMBOL_COL].isin(common_symbols)], [SYMBOL_COL, "Virus"]
+    )
+    all_unique_symbols = set().union(*unique_symbols_by_virus.values()) if unique_symbols_by_virus else set()
+    unique_symbols_full = finalize(
+        master_df[master_df[SYMBOL_COL].isin(all_unique_symbols)], ["Virus", SYMBOL_COL]
+    )
+
+    common_up_full = finalize(
+        up_only_df[up_only_df[SYMBOL_COL].isin(common_up)], [SYMBOL_COL, "Virus"]
+    )
+    common_down_full = finalize(
+        down_only_df[down_only_df[SYMBOL_COL].isin(common_down)], [SYMBOL_COL, "Virus"]
+    )
+
+    all_unique_up = set().union(*unique_up_by_virus.values()) if unique_up_by_virus else set()
+    unique_up_full = finalize(
+        up_only_df[up_only_df[SYMBOL_COL].isin(all_unique_up)], ["Virus", SYMBOL_COL]
+    )
+    all_unique_down = set().union(*unique_down_by_virus.values()) if unique_down_by_virus else set()
+    unique_down_full = finalize(
+        down_only_df[down_only_df[SYMBOL_COL].isin(all_unique_down)], ["Virus", SYMBOL_COL]
+    )
+
+    # --- Write combined outputs ---
+    output_dir = os.path.join(ROOT_DIR, OUTPUT_DIR_NAME)
+    os.makedirs(output_dir, exist_ok=True)
+
+    full_outputs = {
+        "common_symbols_full.csv": common_symbols_full,
+        "unique_symbols_full.csv": unique_symbols_full,
+        "common_up_full.csv": common_up_full,
+        "common_down_full.csv": common_down_full,
+        "unique_up_full.csv": unique_up_full,
+        "unique_down_full.csv": unique_down_full,
+    }
+    for filename, table in full_outputs.items():
+        table.to_csv(os.path.join(output_dir, filename), index=False)
+
+    # --- Quick-look summary workbook (counts only, small/fast) ---
+    summary_path = os.path.join(output_dir, "summary.xlsx")
+    with pd.ExcelWriter(summary_path, engine="openpyxl") as writer:
+        summary_counts_df(any_dir_map).to_excel(writer, sheet_name="Common_Unique_Symbols", index=False)
+        summary_counts_df(up_map).to_excel(writer, sheet_name="Up_Symbols", index=False)
+        summary_counts_df(down_map).to_excel(writer, sheet_name="Down_Symbols", index=False)
+
+    # --- Per-virus files (blank columns dropped) ---
+    by_virus_dir = os.path.join(output_dir, "by_virus")
+    written_symbols = write_per_virus_full(master_df, unique_symbols_by_virus, "Symbols", by_virus_dir)
+    written_up = write_per_virus_full(up_only_df, unique_up_by_virus, "Up", by_virus_dir)
+    written_down = write_per_virus_full(down_only_df, unique_down_by_virus, "Down", by_virus_dir)
+
+    # --- Console summary ---
+    print("\n=== SUMMARY ===")
+    print(f"Viruses compared:              {n_viruses}")
+    print(f"Common symbols (>=2 viruses):  {len(common_symbols)}  ({len(common_symbols_full)} rows)")
+    print(f"Unique symbols (1 virus):      {sum(len(s) for s in unique_symbols_by_virus.values())}  ({len(unique_symbols_full)} rows)")
+    print(f"Common Up-regulated:           {len(common_up)}  ({len(common_up_full)} rows)")
+    print(f"Common Down-regulated:         {len(common_down)}  ({len(common_down_full)} rows)")
+    print(f"Unique Up-regulated:           {sum(len(s) for s in unique_up_by_virus.values())}  ({len(unique_up_full)} rows)")
+    print(f"Unique Down-regulated:         {sum(len(s) for s in unique_down_by_virus.values())}  ({len(unique_down_full)} rows)")
+    print(f"\nCombined tables written to: {output_dir}")
+    for fn in full_outputs:
+        print(f"  - {fn}")
+    print(f"Per-virus files written to: {by_virus_dir}")
+    for p in written_symbols + written_up + written_down:
+        print(f"  - {os.path.basename(p)}")
+
+
+if __name__ == "__main__":
+    main()
